@@ -87,6 +87,183 @@ func TestIterSegmentation(t *testing.T) {
 	segmentTest(t, "SegmentTestKC", NFKC, segmentTestsK)
 }
 
+// iterInvalidUTF8Tests holds inputs that contain invalid UTF-8 together with
+// the expected iteration result for NFC, NFD, NFKC and NFKD.
+//
+// Invalid runes used to be given a Properties with a size of 0. As nextComposed
+// advances its input by the size of the rune it just processed, a zero size
+// meant Iter.Next could return an empty segment without advancing i.p: Done
+// never started reporting true and a caller looping until Done spun forever.
+// compInfo now hands out a size of 1 for invalid runes, so iteration always
+// makes progress. See golang/go#80142.
+var iterInvalidUTF8Tests = []struct {
+	in  string
+	out [4]string // expected output for NFC, NFD, NFKC and NFKD
+}{
+	// A truncated 4-byte sequence followed by a combining mark is the shortest
+	// input that used to hang NFC and NFKC iteration.
+	{
+		"a\xf3\u0300",
+		[4]string{"a\xf3\u0300", "a\xf3\u0300", "a\xf3\u0300", "a\xf3\u0300"},
+	},
+	{
+		"a\xf0\u0300",
+		[4]string{"a\xf0\u0300", "a\xf0\u0300", "a\xf0\u0300", "a\xf0\u0300"},
+	},
+	{
+		"\xf3\u0300",
+		[4]string{"\xf3\u0300", "\xf3\u0300", "\xf3\u0300", "\xf3\u0300"},
+	},
+	{
+		"aa\xf3\u0300",
+		[4]string{"aa\xf3\u0300", "aa\xf3\u0300", "aa\xf3\u0300", "aa\xf3\u0300"},
+	},
+	{
+		"a\xf3\u0300\u0300",
+		[4]string{
+			"a\xf3\u0300\u0300",
+			"a\xf3\u0300\u0300",
+			"a\xf3\u0300\u0300",
+			"a\xf3\u0300\u0300",
+		},
+	},
+	// Truncated sequences that are not followed by anything.
+	{
+		"\xf3",
+		[4]string{"\xf3", "\xf3", "\xf3", "\xf3"},
+	},
+	{
+		"a\xf3",
+		[4]string{"a\xf3", "a\xf3", "a\xf3", "a\xf3"},
+	},
+	// Illegal continuation bytes already had a non-zero size; verify that they
+	// keep normalizing as before.
+	{
+		"a\xe1\u0300",
+		[4]string{"a\xe1\u0300", "a\xe1\u0300", "a\xe1\u0300", "a\xe1\u0300"},
+	},
+	{
+		"a\xc2\u0300",
+		[4]string{"a\xc2\u0300", "a\xc2\u0300", "a\xc2\u0300", "a\xc2\u0300"},
+	},
+	// A truncated sequence preceded by a composable sequence.
+	{
+		"a\u0300\xf3",
+		[4]string{"\u00e0\xf3", "a\u0300\xf3", "\u00e0\xf3", "a\u0300\xf3"},
+	},
+	// An invalid rune following a rune that has a decomposition.
+	{
+		"\u1e0a\xf3\u0300",
+		[4]string{
+			"\u1e0a\xf3\u0300",
+			"D\u0307\xf3\u0300",
+			"\u1e0a\xf3\u0300",
+			"D\u0307\xf3\u0300",
+		},
+	},
+	// An invalid rune following a multi-segment decomposition.
+	{
+		"\u3332\xf3\u0300",
+		[4]string{
+			"\u3332\xf3\u0300",
+			"\u3332\xf3\u0300",
+			"\u30d5\u30a1\u30e9\u30c3\u30c9\xf3\u0300",
+			"\u30d5\u30a1\u30e9\u30c3\u30c8\u3099\xf3\u0300",
+		},
+	},
+	// An invalid rune reached with a full non-starter buffer.
+	{
+		"a" + grave(maxNonStarters) + "\xf3\u0300",
+		[4]string{
+			"\u00e0" + grave(maxNonStarters-1) + "\xf3\u0300",
+			"a" + grave(maxNonStarters) + "\xf3\u0300",
+			"\u00e0" + grave(maxNonStarters-1) + "\xf3\u0300",
+			"a" + grave(maxNonStarters) + "\xf3\u0300",
+		},
+	},
+}
+
+// iterCollect iterates over s and returns the concatenated segments. It gives
+// up after more iterations than an input of this size can legitimately need, so
+// that an iterator that fails to advance is reported as a failure instead of
+// hanging the test binary.
+func iterCollect(f Form, s string, useBytes bool) (acc []byte, done bool) {
+	iter := Iter{}
+	if useBytes {
+		iter.Init(f, []byte(s))
+	} else {
+		iter.InitString(f, s)
+	}
+	acc = []byte{}
+	for n := 0; !iter.Done(); n++ {
+		if n > 8*len(s)+64 {
+			return acc, false
+		}
+		acc = append(acc, iter.Next()...)
+	}
+	return acc, true
+}
+
+func TestIterInvalidUTF8(t *testing.T) {
+	forms := []Form{NFC, NFD, NFKC, NFKD}
+	names := []string{"NFC", "NFD", "NFKC", "NFKD"}
+	for i, tt := range iterInvalidUTF8Tests {
+		for j, f := range forms {
+			for _, useBytes := range []bool{false, true} {
+				res, done := iterCollect(f, tt.in, useBytes)
+				if !done {
+					t.Errorf("%s:%d:bytes=%v: Iter did not terminate on %+q; got %+q so far",
+						names[j], i, useBytes, tt.in, pc(string(res)))
+					continue
+				}
+				if got := string(res); got != tt.out[j] {
+					t.Errorf("%s:%d:bytes=%v: was %+q; want %+q",
+						names[j], i, useBytes, pc(got), pc(tt.out[j]))
+				}
+			}
+		}
+	}
+}
+
+// TestIterInvalidUTF8Progress exhaustively verifies that iteration terminates
+// for every short combination of bytes that is prone to producing invalid
+// runes. Over a thousand of these needed an unbounded number of Iter.Next calls
+// before golang/go#80142 was fixed.
+func TestIterInvalidUTF8Progress(t *testing.T) {
+	// ASCII, continuation bytes and 2-, 3- and 4-byte leaders. A leader that
+	// runs past the end of the input yields a truncated, and hence invalid,
+	// rune.
+	alphabet := []byte{'a', 0x80, 0xbf, 0xc2, 0xcc, 0xc3, 0xe0, 0xe1, 0xf0, 0xf3, 0xff}
+	forms := []Form{NFC, NFD, NFKC, NFKD}
+	names := []string{"NFC", "NFD", "NFKC", "NFKD"}
+	failed := 0
+	var walk func(b []byte, depth int)
+	walk = func(b []byte, depth int) {
+		if len(b) > 0 {
+			for j, f := range forms {
+				for _, useBytes := range []bool{false, true} {
+					if _, done := iterCollect(f, string(b), useBytes); !done {
+						if failed++; failed <= 10 {
+							t.Errorf("%s:bytes=%v: Iter did not terminate on %+q",
+								names[j], useBytes, string(b))
+						}
+					}
+				}
+			}
+		}
+		if depth == 0 {
+			return
+		}
+		for _, c := range alphabet {
+			walk(append(b, c), depth-1)
+		}
+	}
+	walk(nil, 4)
+	if failed > 10 {
+		t.Errorf("Iter did not terminate for %d inputs in total", failed)
+	}
+}
+
 func segmentTest(t *testing.T, name string, f Form, tests []SegmentTest) {
 	iter := Iter{}
 	for i, tt := range tests {
