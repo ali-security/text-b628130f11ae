@@ -1,0 +1,110 @@
+name: seal-build
+
+# Upstream golang.org/x/text ships no GitHub Actions CI (the project is developed
+# on Gerrit and tested by the Go build dashboard), so this workflow is authored
+# from scratch. It mirrors what the project itself does: `go build ./...` and
+# `go test ./...` against the toolchain contemporary with the v0.21.0 release,
+# plus the canonical module-zip packing that the module proxy performs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Go package/test selector (e.g. ./unicode/norm/...); empty runs the full suite"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    name: module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+
+      # Built as its own module in a temp dir OUTSIDE the checkout, so its
+      # go.mod/go.sum can never land in the module zip.
+      - name: Build module-zip helper
+        run: |
+          set -eux
+          HELPER="$(mktemp -d)"
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/main.go"
+          cd "$HELPER"
+          go mod init example.com/createmod
+          go get golang.org/x/mod@v0.24.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          # zip.CreateFromDir skips .git but descends into .github. Upstream
+          # x/text ships no .github, so the whole dir is ours and must not
+          # appear in the artifact.
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" golang.org/x/text v0.21.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.21.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.21.0.zip" | tail -n 5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.21.0.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Per-OS toolchain. Linux runs the toolchain contemporary with the
+        # v0.21.0 release (Dec 2024). macOS is pinned to 1.23, the one version
+        # that clears both constraints:
+        #   - 1.22 and older link Mach-O binaries with no LC_UUID load command,
+        #     which current macOS dyld refuses to load, aborting every test
+        #     binary ("missing LC_UUID load command" / "signal: abort trap")
+        #     before a single test runs.
+        #   - 1.24 and newer ship a stricter `go vet` tests analyzer that
+        #     rejects this release's pre-existing malformed doc examples
+        #     (e.g. ExampleCollator_Strings), failing the build on code that
+        #     is not under test here.
+        # Both are toolchain/runner-image artefacts, not x/text behaviours.
+        include:
+          - os: ubuntu-latest
+            go-version: "1.22"
+          - os: macos-latest
+            go-version: "1.23"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Go version
+        run: |
+          set -eux
+          go version
+          go env GOOS GOARCH
+
+      - name: Build
+        run: |
+          set -eux
+          go build ./...
+
+      - name: Test
+        run: |
+          set -eux
+          go test ${{ inputs.test-filter || './...' }}
